@@ -6,6 +6,7 @@ namespace App\Http\Controllers\Auth;
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Models\CustomerCredit;
+use App\Models\Cart;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
@@ -143,7 +144,7 @@ class AuthController extends Controller
 
         $user = User::where('email', $request->email)->first();
 
-        if (!$user || !Hash::check($request->password, $user->password)) { // 👈 Utilise Hash::check
+        if (!$user || !Hash::check($request->password, $user->password)) {
             return response()->json([
                 'success' => false,
                 'message' => 'Email ou mot de passe incorrect'
@@ -157,7 +158,56 @@ class AuthController extends Controller
             ], 403);
         }
 
+        // 🔥 FUSIONNER LE PANIER DE LA SESSION AVEC LE PANIER DE L'UTILISATEUR
+        $sessionId = $request->header('X-Session-ID') ?? $request->cookie('cart_session');
+        
+        if ($sessionId) {
+            // Chercher un panier de session
+            $sessionCart = Cart::where('session_id', $sessionId)
+                ->where('status', 'active')
+                ->first();
+            
+            // Chercher le panier de l'utilisateur
+            $userCart = Cart::where('user_id', $user->id)
+                ->where('status', 'active')
+                ->first();
+            
+            if ($sessionCart && $sessionCart->items->isNotEmpty()) {
+                if ($userCart) {
+                    // Fusionner les deux paniers
+                    foreach ($sessionCart->items as $sessionItem) {
+                        $existingItem = $userCart->items()
+                            ->where('product_id', $sessionItem->product_id)
+                            ->first();
+                        
+                        if ($existingItem) {
+                            // Ajouter les quantités
+                            $existingItem->quantity += $sessionItem->quantity;
+                            $existingItem->save();
+                        } else {
+                            // Transférer l'item au panier utilisateur
+                            $sessionItem->cart_id = $userCart->id;
+                            $sessionItem->save();
+                        }
+                    }
+                    // Supprimer l'ancien panier de session
+                    $sessionCart->delete();
+                } else {
+                    // Assigner le panier de session à l'utilisateur
+                    $sessionCart->user_id = $user->id;
+                    $sessionCart->session_id = null;
+                    $sessionCart->save();
+                }
+            }
+        }
+
         $token = $user->createToken('auth_token')->plainTextToken;
+
+        // Charger le panier final
+        $finalCart = Cart::with('items.product')
+            ->where('user_id', $user->id)
+            ->where('status', 'active')
+            ->first();
 
         return response()->json([
             'success' => true,
@@ -165,10 +215,32 @@ class AuthController extends Controller
             'data' => [
                 'user' => $this->formatUserData($user),
                 'access_token' => $token,
-                'token_type' => 'Bearer'
+                'token_type' => 'Bearer',
+                'cart' => $finalCart ? [
+                    'id' => $finalCart->id,
+                    'items' => $finalCart->items->map(function($item) {
+                        return [
+                            'id' => $item->id,
+                            'product_id' => $item->product_id,
+                            'quantity' => $item->quantity,
+                            'product' => $item->product,
+                            'price' => $item->price_at_time,
+                            'subtotal' => $item->price_at_time * $item->quantity,
+                        ];
+                    })->values(),
+                    'total_items' => $finalCart->total_items,
+                    'subtotal' => $finalCart->subtotal,
+                ] : [
+                    'id' => null,
+                    'items' => [],
+                    'total_items' => 0,
+                    'subtotal' => 0,
+                ],
             ]
         ]);
     }
+
+    
     /**
      * Ajouter un fournisseur pour un commerçant (après inscription)
      */

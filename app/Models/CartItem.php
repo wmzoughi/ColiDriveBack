@@ -1,43 +1,40 @@
 <?php
-// app/Models/OrderItem.php
+// app/Models/CartItem.php
 
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
-class OrderItem extends Model
+class CartItem extends Model
 {
     use HasFactory;
 
-    protected $table = 'order_items';
-
     protected $fillable = [
-        'order_id',
+        'cart_id',
         'product_id',
-        'product_name',
-        'product_sku',
-        'price',
         'quantity',
-        'subtotal',
-        'product_snapshot',
+        'price_at_time'
     ];
 
     protected $casts = [
-        'price' => 'float',
-        'subtotal' => 'float',
-        'product_snapshot' => 'array',
+        'price_at_time' => 'float',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
     ];
 
-    public function order()
+    public function cart()
     {
-        return $this->belongsTo(Order::class);
+        return $this->belongsTo(Cart::class);
     }
 
     public function product()
     {
         return $this->belongsTo(Product::class);
+    }
+
+    public function getSubtotalAttribute()
+    {
+        return $this->price_at_time * $this->quantity;
     }
 }

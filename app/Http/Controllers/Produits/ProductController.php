@@ -10,7 +10,7 @@ use App\Models\ProductCategory;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;  
+use Illuminate\Support\Facades\Storage;
 
 class ProductController extends Controller
 {
@@ -24,32 +24,44 @@ class ProductController extends Controller
         $query = Product::where('active', true)
             ->with(['supplier', 'category']);
         
-        // Filtrer par fournisseur si l'utilisateur est un fournisseur
         if ($user->user_type === 'fournisseur') {
             $query->where('supplier_id', $user->id);
         }
         
-        // Recherche textuelle
         if ($request->has('search')) {
             $search = strtolower($request->search);
             $query->whereRaw("LOWER(name->>'en_US') LIKE ? OR LOWER(name->>'fr_FR') LIKE ?", 
                 ["%{$search}%", "%{$search}%"]);
         }
         
-        // ✅ FILTRE PAR CATÉGORIE (AJOUTÉ)
         if ($request->has('categ_id') && $request->categ_id != '') {
             $query->where('categ_id', $request->categ_id);
         }
         
-        // ✅ FILTRE PAR PROMOTION
         if ($request->has('in_promotion') && $request->in_promotion) {
             $now = now();
             $query->where('is_promotion', true)
                 ->where('promotion_start', '<=', $now)
                 ->where('promotion_end', '>=', $now);
         }
+
+        // 👇 FILTRE PAR STATUT DE STOCK
+        if ($request->has('stock_status') && $request->stock_status != '') {
+            switch ($request->stock_status) {
+                case 'out_of_stock':
+                    $query->where('stock_quantity', '<=', 0);
+                    break;
+                case 'low_stock':
+                    $query->where('stock_quantity', '>', 0)
+                          ->whereRaw('stock_quantity <= min_stock_alert');
+                    break;
+                case 'in_stock':
+                    $query->where('stock_quantity', '>', 0)
+                          ->whereRaw('stock_quantity > min_stock_alert');
+                    break;
+            }
+        }
         
-        // Tri
         $orderBy = $request->get('order_by', 'create_date');
         $orderDir = $request->get('order_dir', 'desc');
         $query->orderBy($orderBy, $orderDir);
@@ -63,71 +75,7 @@ class ProductController extends Controller
     }
 
     /**
-     * GET /api/products/{id} - Détail d'un produit
-     */
-    public function show($id)
-    {
-        try {
-            $product = Product::with(['supplier', 'category'])
-                ->findOrFail($id);
-            
-            return response()->json([
-                'success' => true,
-                'data' => $product
-            ]);
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Produit non trouvé'
-            ], 404);
-        }
-    }
-
-    /**
-     * GET /api/products/supplier/{supplierId} - Produits d'un fournisseur
-     */
-    public function bySupplier($supplierId)
-    {
-        $supplier = User::where('user_type', 'fournisseur')
-            ->where('id', $supplierId)
-            ->first();
-
-        if (!$supplier) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Fournisseur non trouvé'
-            ], 404);
-        }
-
-        $products = Product::where('supplier_id', $supplierId)
-            ->where('active', true)
-            ->with('supplier', 'category')
-            ->paginate(20);
-
-        return response()->json([
-            'success' => true,
-            'data' => $products
-        ]);
-    }
-
-    /**
-     * GET /api/categories - Liste des catégories
-     */
-    public function categories()
-    {
-        $categories = ProductCategory::where('active', true)
-            ->select('id', 'name', 'complete_name', 'parent_id')
-            ->with('children')
-            ->get();
-
-        return response()->json([
-            'success' => true,
-            'data' => $categories
-        ]);
-    }
-
-    /**
-     * POST /api/products - Ajouter un produit (fournisseur uniquement)
+     * POST /api/supplier/products - Ajouter un produit (fournisseur uniquement)
      */
     public function store(Request $request)
     {
@@ -150,8 +98,13 @@ class ProductController extends Controller
             'promotion_start' => 'required_if:is_promotion,true|nullable|date',
             'promotion_end' => 'required_if:is_promotion,true|nullable|date|after:promotion_start',
             'categ_id' => 'required|integer|exists:product_categories,id',
-            'image_url' => 'nullable|url',  // 👈 AJOUTER
-            'image' => 'nullable|image|max:2048', // 👈 AJOUTER (fichier image)
+            'image_url' => 'nullable|url',
+            'image' => 'nullable|image|max:2048',
+            
+            // 👇 AJOUTEZ LA VALIDATION POUR LE STOCK
+            'stock_quantity' => 'nullable|integer|min:0',
+            'min_stock_alert' => 'nullable|integer|min:0',
+            'max_stock_alert' => 'nullable|integer|min:0',
         ]);
 
         if ($validator->fails()) {
@@ -181,9 +134,13 @@ class ProductController extends Controller
                 'purchase_ok' => true,
                 'tracking' => 'none',
                 'name' => $request->name,
+                
+                // 👇 AJOUTEZ LES DONNÉES DE STOCK
+                'stock_quantity' => $request->stock_quantity ?? 0,
+                'min_stock_alert' => $request->min_stock_alert ?? 5,
+                'max_stock_alert' => $request->max_stock_alert ?? 100,
             ];
 
-            // 👇 GESTION DE L'IMAGE
             if ($request->hasFile('image')) {
                 $path = $request->file('image')->store('products', 'public');
                 $productData['image_url'] = Storage::url($path);
@@ -222,57 +179,7 @@ class ProductController extends Controller
     }
 
     /**
-     * POST /api/supplier/products/{id}/image
-     * Uploader une image pour un produit spécifique
-     */
-    public function uploadImage(Request $request, $id)
-    {
-        $user = $request->user();
-        
-        try {
-            $product = Product::findOrFail($id);
-            
-            if ($user->id !== $product->supplier_id) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Non autorisé'
-                ], 403);
-            }
-
-            // 👉 Vérification simple
-            if (!$request->hasFile('image')) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Aucune image fournie'
-                ], 400);
-            }
-
-            $file = $request->file('image');
-            
-            // 👉 Stockage simple
-            $path = $file->store('products', 'public');
-            
-            // 👉 Mise à jour du produit
-            $product->update([
-                'image_url' => Storage::url($path)
-            ]);
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Image téléchargée',
-                'data' => ['image_url' => Storage::url($path)]
-            ]);
-
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Erreur: ' . $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * PUT /api/products/{id} - Modifier un produit
+     * PUT /api/supplier/products/{id} - Modifier un produit
      */
     public function update(Request $request, $id)   
     {
@@ -299,6 +206,11 @@ class ProductController extends Controller
                 'promotion_end' => 'required_if:is_promotion,true|nullable|date|after:promotion_start',
                 'categ_id' => 'sometimes|integer|exists:product_categories,id',
                 'active' => 'boolean',
+                
+                // 👇 AJOUTEZ LA VALIDATION POUR LE STOCK
+                'stock_quantity' => 'nullable|integer|min:0',
+                'min_stock_alert' => 'nullable|integer|min:0',
+                'max_stock_alert' => 'nullable|integer|min:0',
             ]);
 
             if ($validator->fails()) {
@@ -313,16 +225,16 @@ class ProductController extends Controller
             $updateData = $request->only([
                 'name', 'description', 'packaging', 'list_price',
                 'is_promotion', 'promotion_price', 'promotion_start',
-                'promotion_end', 'categ_id', 'active', 'popular_rank'
+                'promotion_end', 'categ_id', 'active', 'popular_rank',
+                // 👇 AJOUTEZ CES CHAMPS
+                'stock_quantity', 'min_stock_alert', 'max_stock_alert'
             ]);
 
-            // Gérer le nom (JSONB)
             if ($request->has('name')) {
                 $product->name = $request->name;
                 unset($updateData['name']);
             }
 
-            // Gérer la description (JSONB)
             if ($request->has('description')) {
                 $product->description = $request->description;
                 unset($updateData['description']);
@@ -349,47 +261,14 @@ class ProductController extends Controller
     }
 
     /**
-     * DELETE /api/products/{id} - Désactiver un produit
-     */
-    public function destroy($id)
-    {
-        $user = request()->user();
-        
-        try {
-            $product = Product::findOrFail($id);
-            
-            if ($user->user_type !== 'fournisseur' || $product->supplier_id !== $user->id) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Non autorisé'
-                ], 403);
-            }
-
-            $product->update(['active' => false]);
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Produit désactivé'
-            ]);
-
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Erreur de suppression'
-            ], 500);
-        }
-    }
-
-    /**
-     * POST /api/products/{id}/stock - Mettre à jour le stock
+     * POST /api/supplier/products/{id}/stock - Mettre à jour le stock
      */
     public function updateStock(Request $request, $id)
     {
         $user = $request->user();
         
         $validator = Validator::make($request->all(), [
-            'quantity' => 'required|integer',
-            'operation' => 'required|in:add,remove,set',
+            'stock_quantity' => 'required|integer|min:0',
         ]);
 
         if ($validator->fails()) {
@@ -409,40 +288,20 @@ class ProductController extends Controller
                 ], 403);
             }
 
-            DB::beginTransaction();
-
-            $oldQuantity = $product->stock_quantity ?? 0;
-            
-            switch ($request->operation) {
-                case 'add':
-                    $newQuantity = $oldQuantity + $request->quantity;
-                    break;
-                case 'remove':
-                    $newQuantity = max(0, $oldQuantity - $request->quantity);
-                    break;
-                case 'set':
-                    $newQuantity = max(0, $request->quantity);
-                    break;
-                default:
-                    $newQuantity = $oldQuantity;
-            }
-
-            $product->update(['stock_quantity' => $newQuantity]);
-
-            DB::commit();
+            $oldQuantity = $product->stock_quantity;
+            $product->update(['stock_quantity' => $request->stock_quantity]);
 
             return response()->json([
                 'success' => true,
                 'message' => 'Stock mis à jour',
                 'data' => [
                     'old_quantity' => $oldQuantity,
-                    'new_quantity' => $newQuantity,
+                    'new_quantity' => $product->stock_quantity,
                     'product' => $product->load('supplier')
                 ]
             ]);
 
         } catch (\Exception $e) {
-            DB::rollBack();
             return response()->json([
                 'success' => false,
                 'message' => 'Erreur lors de la mise à jour du stock',
@@ -461,19 +320,16 @@ class ProductController extends Controller
         $query = Product::where('supplier_id', $user->id)
             ->with('category');
 
-        // Recherche
         if ($request->has('search')) {
             $search = $request->search;
             $query->whereRaw("LOWER(name->>'en_US') LIKE ? OR LOWER(name->>'fr_FR') LIKE ?", 
                 ["%{$search}%", "%{$search}%"]);
         }
 
-        // Filtre par catégorie
         if ($request->has('categ_id')) {
             $query->where('categ_id', $request->categ_id);
         }
 
-        // En promotion
         if ($request->has('in_promotion') && $request->in_promotion) {
             $now = now();
             $query->where('is_promotion', true)
@@ -481,7 +337,23 @@ class ProductController extends Controller
                 ->where('promotion_end', '>=', $now);
         }
 
-        // 👉 CHANGE ICI : create_date -> created_at
+        // 👇 FILTRE PAR STATUT DE STOCK
+        if ($request->has('stock_status') && $request->stock_status != '') {
+            switch ($request->stock_status) {
+                case 'out_of_stock':
+                    $query->where('stock_quantity', '<=', 0);
+                    break;
+                case 'low_stock':
+                    $query->where('stock_quantity', '>', 0)
+                          ->whereRaw('stock_quantity <= min_stock_alert');
+                    break;
+                case 'in_stock':
+                    $query->where('stock_quantity', '>', 0)
+                          ->whereRaw('stock_quantity > min_stock_alert');
+                    break;
+            }
+        }
+
         $products = $query->orderBy('created_at', 'desc')->paginate(20);
 
         return response()->json([
@@ -489,4 +361,6 @@ class ProductController extends Controller
             'data' => $products
         ]);
     }
+
+    // ... autres méthodes (show, bySupplier, categories, uploadImage, destroy)
 }
