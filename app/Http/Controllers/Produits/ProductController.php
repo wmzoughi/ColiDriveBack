@@ -10,11 +10,11 @@ use App\Models\ProductCategory;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Storage;  
 
 class ProductController extends Controller
 {
-    /**
+        /**
      * GET /api/products - Liste des produits
      */
     public function index(Request $request)
@@ -26,6 +26,11 @@ class ProductController extends Controller
         
         if ($user->user_type === 'fournisseur') {
             $query->where('supplier_id', $user->id);
+        }
+
+          // ✅ AJOUTER FILTRE PAR FOURNISSEUR POUR LES COMMERÇANTS
+        if ($request->has('supplier_id') && $request->supplier_id != '') {
+            $query->where('supplier_id', $request->supplier_id);
         }
         
         if ($request->has('search')) {
@@ -362,5 +367,237 @@ class ProductController extends Controller
         ]);
     }
 
-    // ... autres méthodes (show, bySupplier, categories, uploadImage, destroy)
+
+    /**
+     * GET /api/products/{id} - Détail d'un produit
+     */
+    public function show($id)
+    {
+        try {
+            $product = Product::with(['supplier', 'category'])
+                ->findOrFail($id);
+            
+            return response()->json([
+                'success' => true,
+                'data' => $product
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Produit non trouvé'
+            ], 404);
+        }
+    }
+
+    /**
+     * GET /api/products/supplier/{supplierId} - Produits d'un fournisseur
+     */
+
+    public function bySupplier(Request $request, $supplierId)
+    {
+        // Vérifier que le fournisseur existe
+        $supplier = User::where('user_type', 'fournisseur')
+            ->where('id', $supplierId)
+            ->first();
+
+        if (!$supplier) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Fournisseur non trouvé'
+            ], 404);
+        }
+
+        // ✅ CRÉER LA REQUÊTE DE BASE
+        $query = Product::where('supplier_id', $supplierId)
+            ->where('active', true)
+            ->with(['category']);
+
+        // ✅ RECHERCHE dans les produits du fournisseur
+        if ($request->has('search') && !empty($request->search)) {
+            $search = strtolower($request->search);
+            $query->where(function($q) use ($search) {
+                $q->whereRaw("LOWER(name->>'en_US') LIKE ?", ["%{$search}%"])
+                ->orWhereRaw("LOWER(name->>'fr_FR') LIKE ?", ["%{$search}%"]);
+            });
+        }
+
+        // ✅ FILTRE par catégorie
+        if ($request->has('categ_id') && $request->categ_id != '') {
+            $query->where('categ_id', $request->categ_id);
+        }
+
+        // ✅ FILTRE par promotion
+        if ($request->has('in_promotion') && $request->in_promotion) {
+            $now = now();
+            $query->where('is_promotion', true)
+                ->where('promotion_start', '<=', $now)
+                ->where('promotion_end', '>=', $now);
+        }
+
+        // ✅ FILTRE par statut de stock
+        if ($request->has('stock_status') && $request->stock_status != '') {
+            switch ($request->stock_status) {
+                case 'out_of_stock':
+                    $query->where('stock_quantity', '<=', 0);
+                    break;
+                case 'low_stock':
+                    $query->where('stock_quantity', '>', 0)
+                        ->whereRaw('stock_quantity <= min_stock_alert');
+                    break;
+                case 'in_stock':
+                    $query->where('stock_quantity', '>', 0)
+                        ->whereRaw('stock_quantity > min_stock_alert');
+                    break;
+            }
+        }
+
+        // ✅ TRI
+        $orderBy = $request->get('order_by', 'created_at');
+        $orderDir = $request->get('order_dir', 'desc');
+        
+        // Mapper les noms de colonnes
+        $orderByMap = [
+            'popular_rank' => 'popular_rank',
+            'list_price' => 'list_price',
+            'create_date' => 'created_at',
+            'name' => 'name',
+        ];
+        
+        $orderBy = $orderByMap[$orderBy] ?? 'created_at';
+        $query->orderBy($orderBy, $orderDir);
+
+        // ✅ PAGINATION
+        $products = $query->paginate(20);
+
+        // ✅ RETOURNER LA RÉPONSE
+        return response()->json([
+            'success' => true,
+            'data' => $products,
+            'supplier' => [
+                'id' => $supplier->id,
+                'name' => $supplier->name,
+                'company_name' => $supplier->company_name,
+            ]
+        ]);
+    }
+
+    /**
+     * GET /api/categories - Liste des catégories
+     */
+    public function categories()
+    {
+        $categories = ProductCategory::where('active', true)
+            ->select('id', 'name', 'complete_name', 'parent_id')
+            ->with('children')
+            ->get();
+
+        return response()->json([
+            'success' => true,
+            'data' => $categories
+        ]);
+    }
+
+
+    /**
+     * POST /api/supplier/products/{id}/image
+     * Uploader une image pour un produit spécifique
+     */
+    public function uploadImage(Request $request, $id)
+    {
+        $user = $request->user();
+        
+        try {
+            $product = Product::findOrFail($id);
+            
+            if ($user->id !== $product->supplier_id) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Non autorisé'
+                ], 403);
+            }
+
+            if (!$request->hasFile('image')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Aucune image fournie'
+                ], 400);
+            }
+
+            // ✅ AJOUTER LA VALIDATION DU FICHIER
+            $validator = Validator::make($request->all(), [
+                'image' => 'required|image|mimes:jpeg,png,jpg,gif|max:2048',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+
+            $file = $request->file('image');
+            
+            // ✅ SUPPRIMER L'ANCIENNE IMAGE
+            if ($product->image_url) {
+                $oldPath = str_replace('/storage/', '', $product->image_url);
+                if (Storage::disk('public')->exists($oldPath)) {
+                    Storage::disk('public')->delete($oldPath);
+                }
+            }
+            
+            $path = $file->store('products', 'public');
+            $imageUrl = Storage::url($path);
+            
+            $product->update(['image_url' => $imageUrl]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Image téléchargée avec succès',
+                'data' => ['image_url' => $imageUrl]
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+
+    /**
+     * DELETE /api/products/{id} - Désactiver un produit
+     */
+    public function destroy($id)
+    {
+        $user = request()->user();
+        
+        try {
+            $product = Product::findOrFail($id);
+            
+            if ($user->user_type !== 'fournisseur' || $product->supplier_id !== $user->id) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Non autorisé'
+                ], 403);
+            }
+
+            $product->update(['active' => false]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Produit désactivé'
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur de suppression'
+            ], 500);
+        }
+    }
+
+
+
+   
 }

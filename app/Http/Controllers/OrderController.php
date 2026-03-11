@@ -18,6 +18,7 @@ class OrderController extends Controller
     /**
      * POST /api/supplier/orders - Créer une commande (pour fournisseur)
      */
+
     public function store(Request $request)
     {
         $user = $request->user();
@@ -54,6 +55,20 @@ class OrderController extends Controller
         DB::beginTransaction();
 
         try {
+            // ✅ VÉRIFIER LE STOCK AVANT DE CRÉER LA COMMANDE
+            foreach ($cart->items as $cartItem) {
+                $product = $cartItem->product;
+                
+                // Vérifier si le produit a un stock suffisant
+                if ($product->stock_quantity < $cartItem->quantity) {
+                    DB::rollBack();
+                    return response()->json([
+                        'success' => false,
+                        'message' => "Stock insuffisant pour {$product->name}. Disponible: {$product->stock_quantity}, Demandé: {$cartItem->quantity}"
+                    ], 400);
+                }
+            }
+
             // Calculer les totaux
             $subtotal = $cart->subtotal;
             $tax = $subtotal * 0.20; // TVA 20%
@@ -77,7 +92,7 @@ class OrderController extends Controller
                 'payment_method' => $request->payment_method,
             ]);
 
-            // Créer les articles de commande
+            // Créer les articles de commande ET METTRE À JOUR LE STOCK
             foreach ($cart->items as $cartItem) {
                 $product = $cartItem->product;
                 
@@ -94,8 +109,14 @@ class OrderController extends Controller
                         'description' => $product->description,
                         'image_url' => $product->image_url,
                         'packaging' => $product->packaging,
+                        'supplier_id' => $product->supplier_id,
+                        'supplier_name' => $product->supplier->company_name ?? $product->supplier->name,
                     ]),
                 ]);
+
+                // ✅ DÉCRÉMENTER LE STOCK
+                $product->stock_quantity -= $cartItem->quantity;
+                $product->save();
             }
 
             // Marquer le panier comme converti
@@ -178,20 +199,31 @@ class OrderController extends Controller
     /**
      * POST /api/supplier/orders/{id}/cancel - Annuler une commande (pour fournisseur)
      */
+    // app/Http/Controllers/OrderController.php
+
     public function cancel(Request $request, $id)
     {
         $user = $request->user();
 
-        $order = Order::whereHas('items.product', function($q) use ($user) {
-                $q->where('supplier_id', $user->id);
-            })
-            ->find($id);
+        $order = Order::with('items.product')->find($id);
 
         if (!$order) {
             return response()->json([
                 'success' => false,
                 'message' => 'Commande non trouvée'
             ], 404);
+        }
+
+        // Vérifier que la commande contient des produits de ce fournisseur
+        $hasSupplierProducts = $order->items()->whereHas('product', function($q) use ($user) {
+            $q->where('supplier_id', $user->id);
+        })->exists();
+
+        if (!$hasSupplierProducts) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cette commande ne contient pas vos produits'
+            ], 403);
         }
 
         if (!in_array($order->status, [Order::STATUS_PENDING, Order::STATUS_CONFIRMED])) {
@@ -214,6 +246,15 @@ class OrderController extends Controller
 
         DB::beginTransaction();
         try {
+            // ✅ RESTAURER LE STOCK
+            foreach ($order->items as $item) {
+                $product = $item->product;
+                if ($product) {
+                    $product->stock_quantity += $item->quantity;
+                    $product->save();
+                }
+            }
+
             $order->status = Order::STATUS_CANCELLED;
             $order->cancelled_at = now();
             $order->cancellation_reason = $request->reason;
@@ -223,7 +264,7 @@ class OrderController extends Controller
 
             return response()->json([
                 'success' => true,
-                'message' => 'Commande annulée',
+                'message' => 'Commande annulée et stock restauré',
                 'data' => $order
             ]);
         } catch (\Exception $e) {
